@@ -62,16 +62,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-layers", type=int, default=2)
     parser.add_argument("--dropout", type=float, default=0.35)
     parser.add_argument("--grad-clip", type=float, default=5.0)
-    parser.add_argument("--num-workers", type=int, default=2)
-    parser.add_argument("--attention-heads", type=int, default=4)
-    parser.add_argument("--attention-hidden", type=int, default=160)
-    parser.add_argument("--transformer-layers", type=int, default=2)
-    parser.add_argument("--transformer-heads", type=int, default=4)
-    parser.add_argument("--transformer-ffn", type=int, default=1024)
+    parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--use-spec-augment", action="store_true")
-    parser.add_argument("--no-spec-augment", dest="use_spec_augment", action="store_false")
-    parser.add_argument("--no-class-weights", dest="use_class_weights", action="store_false")
-    parser.set_defaults(use_spec_augment=True, use_class_weights=True)
     return parser.parse_args()
 
 
@@ -93,7 +85,7 @@ def make_dataloaders(
     batch_size: int,
     num_workers: int,
     use_spec_augment: bool,
-) -> Tuple[DataLoader, DataLoader, DataLoader, np.ndarray]:
+) -> Tuple[DataLoader, DataLoader, DataLoader]:
     augment_fn = SpecAugment(p=0.4) if use_spec_augment else None
     train_df = stratified_split(df, "train")
     val_df = stratified_split(df, "validation")
@@ -127,18 +119,7 @@ def make_dataloaders(
         collate_fn=emotion_collate,
         pin_memory=True,
     )
-    encoded = train_df["class"].map(encoder.class_to_index).astype(int)
-    counts = (
-        encoded.value_counts().reindex(range(encoder.num_classes), fill_value=0).sort_index()
-    )
-    return train_loader, eval_loader, test_loader, counts.to_numpy(dtype=np.int64)
-
-
-def compute_class_weights(class_counts: np.ndarray) -> torch.Tensor:
-    class_counts = np.maximum(class_counts, 1)
-    total = class_counts.sum()
-    weights = total / (class_counts * class_counts.size)
-    return torch.tensor(weights, dtype=torch.float32)
+    return train_loader, eval_loader, test_loader
 
 
 def run_epoch(
@@ -158,7 +139,6 @@ def run_epoch(
     for features, targets, lengths in data_loader:
         features = [f.to(device) for f in features]
         targets = targets.to(device)
-        lengths = lengths.to(device)
         logits = model(features, lengths)
         loss = criterion(logits, targets)
 
@@ -190,7 +170,6 @@ def evaluate_predictions(
     with torch.no_grad():
         for features, labels, lengths in data_loader:
             features = [f.to(device) for f in features]
-            lengths = lengths.to(device)
             logits = model(features, lengths)
             preds = logits.argmax(dim=1).cpu().numpy().tolist()
             predictions.extend(preds)
@@ -212,7 +191,7 @@ def main() -> None:
     encoder = LabelEncoder.from_series(df["class"])
     normalisation_stats = load_normalisation_stats(args.features_root)
 
-    train_loader, val_loader, test_loader, class_counts = make_dataloaders(
+    train_loader, val_loader, test_loader = make_dataloaders(
         df,
         args.features_root,
         encoder,
@@ -228,21 +207,9 @@ def main() -> None:
         hidden_size=args.hidden_size,
         num_layers=args.num_layers,
         dropout=args.dropout,
-        attention_heads=args.attention_heads,
-        attention_hidden=args.attention_hidden,
-        transformer_layers=args.transformer_layers,
-        transformer_heads=args.transformer_heads,
-        transformer_ffn=args.transformer_ffn,
     ).to(device)
 
-    if args.use_class_weights:
-        class_weights = compute_class_weights(class_counts).to(device)
-    else:
-        class_weights = None
-    criterion = nn.CrossEntropyLoss(
-        weight=class_weights,
-        label_smoothing=args.label_smoothing,
-    )
+    criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
     optimizer = AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
     scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs)
 

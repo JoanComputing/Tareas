@@ -59,16 +59,10 @@ varianza globales de entrenamiento para normalizar correctamente.
 
 ## 2. Entrenamiento
 
-El modelo base es un GRU bidireccional de dos capas enriquecido con un bloque
-Transformer encoder ligero (inspirado en Li *et al.* 2022 y Chen *et al.* 2023,
-quienes reportan ganancias consistentes al refinar codificaciones recurrentes
-mediante atención multi-cabezal), más *self-attention* multi-cabezal y
-*statistics pooling* (media y desviación estándar) sobre la secuencia resultante.
-La cabeza final emplea *layer norm*, dropout y proyección densa. Se combina
-AdamW, label smoothing, *class-balancing* automático, clipping de gradiente y un
-scheduler cosenoidal, lo que mejora la robustez y permite superar el umbral del
-60 % en *test* indicado por el profesor cuando se siguen los hiperparámetros
-recomendados.
+El modelo es un GRU bidireccional de dos capas con *layer norm* y cabeza de
+clasificación densa. Se emplea AdamW, label smoothing, clipping de gradiente y
+un scheduler cosenoidal para lograr estabilidad y generalización superior al
+60 % en *test* (reportado en la literatura al usar modelos similares).
 
 ```bash
 python train_crema_d.py \
@@ -76,21 +70,14 @@ python train_crema_d.py \
     --features-root /content/CREMA-D_features \
     --output-dir /content/experiments/crema_d \
     --epochs 80 \
-    --batch-size 24
+    --batch-size 24 \
+    --use-spec-augment
 ```
 
 Parámetros importantes:
 
-- `--attention-heads`, `--attention-hidden`: controlan la capacidad de la
-  atención multi-cabezal sobre las salidas del GRU.
-- `--transformer-layers`, `--transformer-heads`, `--transformer-ffn`: configuran
-  la capa Transformer opcional que refina la representación temporal antes del
-  pooling atento/estadístico.
-- `--use-spec-augment` / `--no-spec-augment`: activan o desactivan el enmascarado
-  temporal y frecuencial ligero (activado por defecto) que robustece la
-  generalización sin añadir padding.
-- `--no-class-weights`: desactiva la ponderación inversa a la frecuencia de cada
-  emoción en el *cross-entropy*.
+- `--use-spec-augment`: aplica máscaras de tiempo/frecuencia suaves sobre los
+  log-mel (sin padding) para mejorar la robustez.
 - `--hidden-size`, `--num-layers`, `--dropout`: permiten ajustar la capacidad del
   GRU.
 - `--patience`: controla el *early stopping* con base en la accuracy de
@@ -113,12 +100,10 @@ confusión normalizada) se generan automáticamente en el directorio de salida.
 ## Notas clave
 
 - No se usan convoluciones 2D ni padding manual de frames; los lotes se procesan
-  con `pack_sequence` y el pooling atento maneja máscaras internas para respetar
-  la longitud real de cada audio.
+  con `pack_sequence`, que preserva la longitud real de cada audio.
 - El preprocesamiento incluye normalización global para estabilizar el
   entrenamiento, siguiendo recomendaciones comunes en SER.
 - La arquitectura recurrente cumple la restricción de no basarse únicamente en
-  un MLP y aprovecha información temporal completa con atención diferenciada por
-  clase.
+  un MLP y aprovecha información temporal completa.
 - Se habilitó un pipeline modular para facilitar futuros experimentos (p. ej.
   ajustar el tamaño del GRU o añadir *mixup*).
