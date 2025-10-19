@@ -42,7 +42,13 @@ if str(SRC_DIR) not in sys.path:
 from crema_d.data import EmotionDataset, LabelEncoder, emotion_collate, stratified_split
 from crema_d.models import EmotionGRU
 from crema_d.plotting import plot_confusion_matrix, plot_history
-from crema_d.utils import Metrics, SpecAugment, set_seed, sklearn_classification_summary
+from crema_d.utils import (
+    Metrics,
+    SpecAugment,
+    load_json,
+    set_seed,
+    sklearn_classification_summary,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -57,13 +63,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--patience", type=int, default=12, help="Early stopping patience")
-    parser.add_argument("--label-smoothing", type=float, default=0.05)
+    parser.add_argument("--label-smoothing", type=float, default=0.02)
     parser.add_argument("--hidden-size", type=int, default=256)
     parser.add_argument("--num-layers", type=int, default=2)
-    parser.add_argument("--dropout", type=float, default=0.35)
+    parser.add_argument("--dropout", type=float, default=0.3)
     parser.add_argument("--grad-clip", type=float, default=5.0)
-    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--num-workers", type=int, default=2)
+    parser.add_argument("--attention-heads", type=int, default=4)
+    parser.add_argument("--attention-hidden", type=int, default=160)
+    parser.add_argument("--transformer-layers", type=int, default=2)
+    parser.add_argument("--transformer-heads", type=int, default=4)
+    parser.add_argument("--transformer-ffn", type=int, default=1024)
     parser.add_argument("--use-spec-augment", action="store_true")
+    parser.add_argument("--no-spec-augment", dest="use_spec_augment", action="store_false")
+    parser.add_argument("--no-class-weights", dest="use_class_weights", action="store_false")
+    parser.add_argument("--no-utterance-norm", dest="per_utterance_norm", action="store_false")
+    parser.set_defaults(use_spec_augment=True, use_class_weights=True, per_utterance_norm=True)
     return parser.parse_args()
 
 
@@ -82,18 +97,52 @@ def make_dataloaders(
     features_root: Path,
     encoder: LabelEncoder,
     normalisation_stats: Dict[str, np.ndarray],
+    metadata: Dict[str, object],
     batch_size: int,
     num_workers: int,
     use_spec_augment: bool,
-) -> Tuple[DataLoader, DataLoader, DataLoader]:
-    augment_fn = SpecAugment(p=0.4) if use_spec_augment else None
+    per_utterance_norm: bool,
+) -> Tuple[DataLoader, DataLoader, DataLoader, np.ndarray]:
+    feature_type = str(metadata.get("feature_type", "mel_prosody"))
+    mel_bins_value = metadata.get("mel_bins")
+    mel_bins = None
+    if mel_bins_value is not None:
+        mel_bins = int(mel_bins_value)
+    elif feature_type != "ssl":
+        mel_bins = int(metadata.get("config", {}).get("n_mels", normalisation_stats["mean"].shape[0]))
+
+    if feature_type == "ssl":
+        augment_fn = None
+        if use_spec_augment:
+            print("SpecAugment disabled automatically for SSL features.")
+    else:
+        augment_fn = SpecAugment(p=0.4, mel_bins=mel_bins) if use_spec_augment else None
     train_df = stratified_split(df, "train")
     val_df = stratified_split(df, "validation")
     test_df = stratified_split(df, "test")
 
-    train_dataset = EmotionDataset(train_df, features_root, encoder, normalisation_stats, augment_fn)
-    val_dataset = EmotionDataset(val_df, features_root, encoder, normalisation_stats)
-    test_dataset = EmotionDataset(test_df, features_root, encoder, normalisation_stats)
+    train_dataset = EmotionDataset(
+        train_df,
+        features_root,
+        encoder,
+        normalisation_stats,
+        augment_fn,
+        per_utterance_norm=per_utterance_norm,
+    )
+    val_dataset = EmotionDataset(
+        val_df,
+        features_root,
+        encoder,
+        normalisation_stats,
+        per_utterance_norm=per_utterance_norm,
+    )
+    test_dataset = EmotionDataset(
+        test_df,
+        features_root,
+        encoder,
+        normalisation_stats,
+        per_utterance_norm=per_utterance_norm,
+    )
 
     train_loader = DataLoader(
         train_dataset,
@@ -119,7 +168,18 @@ def make_dataloaders(
         collate_fn=emotion_collate,
         pin_memory=True,
     )
-    return train_loader, eval_loader, test_loader
+    encoded = train_df["class"].map(encoder.class_to_index).astype(int)
+    counts = (
+        encoded.value_counts().reindex(range(encoder.num_classes), fill_value=0).sort_index()
+    )
+    return train_loader, eval_loader, test_loader, counts.to_numpy(dtype=np.int64)
+
+
+def compute_class_weights(class_counts: np.ndarray) -> torch.Tensor:
+    class_counts = np.maximum(class_counts, 1)
+    total = class_counts.sum()
+    weights = total / (class_counts * class_counts.size)
+    return torch.tensor(weights, dtype=torch.float32)
 
 
 def run_epoch(
@@ -139,6 +199,7 @@ def run_epoch(
     for features, targets, lengths in data_loader:
         features = [f.to(device) for f in features]
         targets = targets.to(device)
+        lengths = lengths.to(device)
         logits = model(features, lengths)
         loss = criterion(logits, targets)
 
@@ -170,6 +231,7 @@ def evaluate_predictions(
     with torch.no_grad():
         for features, labels, lengths in data_loader:
             features = [f.to(device) for f in features]
+            lengths = lengths.to(device)
             logits = model(features, lengths)
             preds = logits.argmax(dim=1).cpu().numpy().tolist()
             predictions.extend(preds)
@@ -190,15 +252,30 @@ def main() -> None:
     df = pd.read_csv(labels_path)
     encoder = LabelEncoder.from_series(df["class"])
     normalisation_stats = load_normalisation_stats(args.features_root)
+    metadata_path = args.features_root / "metadata.json"
+    if not metadata_path.exists():
+        raise FileNotFoundError(
+            "Feature metadata not found. Please rerun precompute_features.py to regenerate features with metadata."
+        )
+    metadata = load_json(metadata_path)
+    expected_dim = int(metadata.get("feature_dim", normalisation_stats["mean"].shape[0]))
+    actual_dim = int(normalisation_stats["mean"].shape[0])
+    if expected_dim != actual_dim:
+        raise ValueError(
+            "Mismatch between feature metadata and normalisation statistics dimensions. "
+            "Regenerate features to ensure consistency."
+        )
 
-    train_loader, val_loader, test_loader = make_dataloaders(
+    train_loader, val_loader, test_loader, class_counts = make_dataloaders(
         df,
         args.features_root,
         encoder,
         normalisation_stats,
+        metadata,
         args.batch_size,
         args.num_workers,
         args.use_spec_augment,
+        args.per_utterance_norm,
     )
 
     model = EmotionGRU(
@@ -207,9 +284,21 @@ def main() -> None:
         hidden_size=args.hidden_size,
         num_layers=args.num_layers,
         dropout=args.dropout,
+        attention_heads=args.attention_heads,
+        attention_hidden=args.attention_hidden,
+        transformer_layers=args.transformer_layers,
+        transformer_heads=args.transformer_heads,
+        transformer_ffn=args.transformer_ffn,
     ).to(device)
 
-    criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
+    if args.use_class_weights:
+        class_weights = compute_class_weights(class_counts).to(device)
+    else:
+        class_weights = None
+    criterion = nn.CrossEntropyLoss(
+        weight=class_weights,
+        label_smoothing=args.label_smoothing,
+    )
     optimizer = AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
     scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs)
 

@@ -49,11 +49,13 @@ class EmotionDataset(Dataset):
         encoder: LabelEncoder,
         normalisation_stats: Dict[str, np.ndarray],
         augment_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
+        per_utterance_norm: bool = True,
     ) -> None:
         self.dataframe = dataframe.reset_index(drop=True)
         self.features_root = features_root
         self.encoder = encoder
         self.augment_fn = augment_fn
+        self.per_utterance_norm = per_utterance_norm
         mean = normalisation_stats["mean"].astype(np.float32)
         std = normalisation_stats["std"].astype(np.float32)
         std[std < 1e-6] = 1e-6
@@ -75,10 +77,17 @@ class EmotionDataset(Dataset):
         row = self.dataframe.iloc[index]
         features = self._load_features(row["path"])
         features = (features - self.mean) / self.std
+        if self.per_utterance_norm:
+            features = self._per_utterance_normalise(features)
         if self.augment_fn is not None:
             features = self.augment_fn(features)
         label = self.encoder.encode(int(row["class"]))
         return features, label
+
+    def _per_utterance_normalise(self, features: torch.Tensor) -> torch.Tensor:
+        mean = features.mean(dim=0, keepdim=True)
+        std = features.std(dim=0, keepdim=True).clamp_min(1e-5)
+        return (features - mean) / std
 
 
 def emotion_collate(batch: Sequence[Tuple[torch.Tensor, int]]) -> Tuple[List[torch.Tensor], torch.LongTensor, torch.LongTensor]:

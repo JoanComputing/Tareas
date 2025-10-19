@@ -1,8 +1,9 @@
-"""Pre-compute log-mel features for the CREMA-D dataset.
+"""Pre-compute acoustic features for the CREMA-D dataset.
 
-This script parallelises feature extraction to speed up later training. The
-resulting directory structure mirrors the original dataset splits and stores
-PyTorch tensors with variable-length time dimensions to avoid zero padding.
+The script parallelises feature extraction to speed up later training. It can
+produce either log-mel + prosody features or self-supervised (SSL) speech
+representations from WavLM / HuBERT bundles. All tensors keep their
+variable-length time dimension to avoid zero padding downstream.
 """
 from __future__ import annotations
 
@@ -23,16 +24,22 @@ SRC_DIR = CURRENT_DIR / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from crema_d.features import LogMelConfig, LogMelExtractor
+from crema_d.features import LogMelConfig, LogMelExtractor, SSLFeatureConfig, SSLFeatureExtractor
 from crema_d.utils import save_json
 
 
-_EXTRACTOR: Optional[LogMelExtractor] = None
+_EXTRACTOR: Optional[object] = None
 
 
 def _initialise_worker(config: Dict[str, object]) -> None:
     global _EXTRACTOR
-    _EXTRACTOR = LogMelExtractor(LogMelConfig(**config))
+    kind = config.get("feature_type", "mel_prosody")
+    if kind == "ssl":
+        ssl_conf = SSLFeatureConfig(**config["ssl"])
+        _EXTRACTOR = SSLFeatureExtractor(ssl_conf)
+    else:
+        mel_conf = LogMelConfig(**config["mel"])
+        _EXTRACTOR = LogMelExtractor(mel_conf)
 
 
 def _process_row(
@@ -47,16 +54,19 @@ def _process_row(
     output_path = features_root / Path(relative_path).with_suffix(".pt")
     output_path.parent.mkdir(parents=True, exist_ok=True)
     features, _ = _EXTRACTOR(audio_path)
-    payload = {"features": features.cpu(), "num_frames": int(features.shape[0])}
+    features = features.cpu()
+    payload = {"features": features, "num_frames": int(features.shape[0])}
     torch.save(payload, output_path)
     if use_for_stats:
-        sum_vec = features.sum(dim=0).cpu().numpy()
-        sumsq_vec = (features.pow(2).sum(dim=0)).cpu().numpy()
+        sum_vec = features.sum(dim=0).double().numpy()
+        sumsq_vec = features.pow(2).sum(dim=0).double().numpy()
         count = int(features.shape[0])
         return sum_vec, sumsq_vec, count
-    return np.zeros(_EXTRACTOR.config.n_mels, dtype=np.float64), np.zeros(
-        _EXTRACTOR.config.n_mels, dtype=np.float64
-    ), 0
+    return (
+        np.zeros(_EXTRACTOR.feature_dim, dtype=np.float64),
+        np.zeros(_EXTRACTOR.feature_dim, dtype=np.float64),
+        0,
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -70,11 +80,36 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--csv", type=str, default="labels.csv", help="Relative path to labels CSV")
     parser.add_argument("--num-workers", type=int, default=mp.cpu_count(), help="Parallel workers")
+    parser.add_argument(
+        "--feature-type",
+        choices=["mel_prosody", "mel", "ssl"],
+        default="ssl",
+        help="Which feature front-end to precompute",
+    )
     parser.add_argument("--sample-rate", type=int, default=16_000)
     parser.add_argument("--n-mels", type=int, default=80)
     parser.add_argument("--n-fft", type=int, default=1024)
     parser.add_argument("--hop-length", type=int, default=256)
     parser.add_argument("--pre-emphasis", type=float, default=0.97)
+    parser.add_argument("--no-deltas", dest="use_deltas", action="store_false")
+    parser.add_argument("--no-delta-delta", dest="use_delta_delta", action="store_false")
+    parser.add_argument("--no-pitch", dest="use_pitch", action="store_false")
+    parser.add_argument("--pitch-fmin", type=float, default=60.0)
+    parser.add_argument("--pitch-fmax", type=float, default=500.0)
+    parser.add_argument(
+        "--ssl-model",
+        type=str,
+        default="WAVLM_BASE_PLUS",
+        help="SSL bundle to use (e.g. WAVLM_BASE_PLUS, HUBERT_BASE)",
+    )
+    parser.add_argument("--ssl-layer", type=int, default=-1, help="Layer index to export from SSL model")
+    parser.add_argument(
+        "--ssl-device",
+        choices=["cpu", "cuda"],
+        default="cpu",
+        help="Device for SSL feature extraction (cuda requires GPU availability)",
+    )
+    parser.set_defaults(use_deltas=True, use_delta_delta=True, use_pitch=True)
     return parser.parse_args()
 
 
@@ -85,13 +120,54 @@ def main() -> None:
         raise FileNotFoundError(f"Could not find labels CSV at {labels_path}")
 
     df = pd.read_csv(labels_path)
-    config = LogMelConfig(
-        sample_rate=args.sample_rate,
-        n_mels=args.n_mels,
-        n_fft=args.n_fft,
-        hop_length=args.hop_length,
-        pre_emphasis=args.pre_emphasis,
-    )
+    feature_type = args.feature_type
+    if feature_type == "ssl":
+        ssl_device = args.ssl_device
+        if ssl_device == "cuda" and not torch.cuda.is_available():
+            print("CUDA requested for SSL extraction but not available; falling back to CPU")
+            ssl_device = "cpu"
+        ssl_config = {
+            "bundle": args.ssl_model,
+            "layer": args.ssl_layer,
+            "device": ssl_device,
+        }
+        prototype = SSLFeatureExtractor(SSLFeatureConfig(**ssl_config))
+        extractor_config = {"feature_type": "ssl", "ssl": ssl_config}
+        feature_dim = prototype.feature_dim
+        ssl_sample_rate = prototype.sample_rate
+        mel_metadata = {}
+    else:
+        use_deltas = args.use_deltas if feature_type == "mel_prosody" else False
+        use_delta_delta = args.use_delta_delta if feature_type == "mel_prosody" else False
+        use_pitch = args.use_pitch if feature_type == "mel_prosody" else False
+        mel_config = {
+            "sample_rate": args.sample_rate,
+            "n_mels": args.n_mels,
+            "n_fft": args.n_fft,
+            "hop_length": args.hop_length,
+            "pre_emphasis": args.pre_emphasis,
+            "use_deltas": use_deltas,
+            "use_delta_delta": use_delta_delta,
+            "use_pitch": use_pitch,
+            "pitch_fmin": args.pitch_fmin,
+            "pitch_fmax": args.pitch_fmax,
+        }
+        config = LogMelConfig(**mel_config)
+        prototype = LogMelExtractor(config)
+        extractor_config = {"feature_type": feature_type, "mel": mel_config}
+        feature_dim = prototype.feature_dim
+        mel_metadata = {
+            "sample_rate": config.sample_rate,
+            "n_mels": config.n_mels,
+            "n_fft": config.n_fft,
+            "hop_length": config.hop_length,
+            "pre_emphasis": config.pre_emphasis,
+            "use_deltas": config.use_deltas,
+            "use_delta_delta": config.use_delta_delta,
+            "use_pitch": config.use_pitch,
+            "pitch_fmin": config.pitch_fmin,
+            "pitch_fmax": config.pitch_fmax,
+        }
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -100,25 +176,14 @@ def main() -> None:
         for row in df.itertuples()
     ]
 
-    total_sum = np.zeros(config.n_mels, dtype=np.float64)
-    total_sumsq = np.zeros(config.n_mels, dtype=np.float64)
+    total_sum = np.zeros(feature_dim, dtype=np.float64)
+    total_sumsq = np.zeros(feature_dim, dtype=np.float64)
     total_frames = 0
 
     with mp.get_context("spawn").Pool(
         processes=args.num_workers,
         initializer=_initialise_worker,
-        initargs=({
-            "sample_rate": config.sample_rate,
-            "n_mels": config.n_mels,
-            "n_fft": config.n_fft,
-            "hop_length": config.hop_length,
-            "pre_emphasis": config.pre_emphasis,
-            "win_length": config.win_length,
-            "center": config.center,
-            "f_min": config.f_min,
-            "f_max": config.f_max,
-            "power": config.power,
-        },),
+        initargs=(extractor_config,),
     ) as pool:
         iterator = pool.imap_unordered(
             partial(_process_row, dataset_root=args.data_root, features_root=args.output_dir),
@@ -137,18 +202,26 @@ def main() -> None:
     std = np.sqrt(np.clip(variance, a_min=1e-8, a_max=None))
     np.savez(args.output_dir / "normalisation.npz", mean=mean.astype(np.float32), std=std.astype(np.float32))
 
-    metadata = {
-        "config": {
-            "sample_rate": config.sample_rate,
-            "n_mels": config.n_mels,
-            "n_fft": config.n_fft,
-            "hop_length": config.hop_length,
-            "pre_emphasis": config.pre_emphasis,
-        },
+    metadata: Dict[str, object] = {
+        "feature_type": feature_type,
         "num_rows": len(df),
         "train_frames": int(total_frames),
+        "feature_dim": feature_dim,
     }
+    if feature_type == "ssl":
+        metadata.update(
+            {
+                "config": {
+                    "ssl_model": args.ssl_model,
+                    "ssl_layer": args.ssl_layer,
+                    "sample_rate": ssl_sample_rate,
+                }
+            }
+        )
+    else:
+        metadata.update({"config": mel_metadata, "mel_bins": mel_metadata.get("n_mels")})
     save_json(metadata, args.output_dir / "metadata.json")
+    del prototype
     print("Feature extraction complete. Normalisation statistics saved.")
 
 

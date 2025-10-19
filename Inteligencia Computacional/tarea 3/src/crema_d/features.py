@@ -1,10 +1,10 @@
 """Feature extraction utilities for the CREMA-D emotion recognition task.
 
 The design avoids zero-padding by returning variable-length time sequences.
-The log-mel configuration follows common recommendations from recent speech
-emotion recognition work that emphasise medium-resolution log-mel spectra with
-strong pre-emphasis and energy normalisation (e.g. Triantafyllopoulos et al.,
-INTERSPEECH 2023).
+It supports both classical log-mel front-ends enriched with prosodic cues and
+self-supervised speech representations (WavLM / HuBERT) that have recently set
+state-of-the-art results in emotion recognition without resorting to 2-D CNNs
+or fixed-length padding.
 """
 from __future__ import annotations
 
@@ -15,6 +15,15 @@ from typing import Optional, Tuple
 
 import torch
 import torchaudio
+
+
+_SSL_BUNDLES = {
+    "WAVLM_BASE": torchaudio.pipelines.WAVLM_BASE,
+    "WAVLM_BASE_PLUS": torchaudio.pipelines.WAVLM_BASE_PLUS,
+    "HUBERT_BASE": torchaudio.pipelines.HUBERT_BASE,
+    "HUBERT_LARGE": torchaudio.pipelines.HUBERT_LARGE,
+    "WAV2VEC2_BASE": torchaudio.pipelines.WAV2VEC2_BASE,
+}
 
 
 @dataclass
@@ -31,6 +40,24 @@ class LogMelConfig:
     center: bool = False
     power: float = 2.0
     pre_emphasis: float = 0.97
+    use_deltas: bool = True
+    use_delta_delta: bool = True
+    use_pitch: bool = True
+    pitch_fmin: float = 60.0
+    pitch_fmax: float = 500.0
+
+    def __post_init__(self) -> None:
+        if self.use_delta_delta and not self.use_deltas:
+            raise ValueError("Delta-delta features require delta features to be enabled.")
+
+    @property
+    def hop_length_ms(self) -> float:
+        return self.hop_length / self.sample_rate * 1000.0
+
+    @property
+    def frame_length_ms(self) -> float:
+        win = self.win_length or self.n_fft
+        return win / self.sample_rate * 1000.0
 
 
 class LogMelExtractor:
@@ -52,6 +79,7 @@ class LogMelExtractor:
             mel_scale="htk",
         )
         self._to_db = torchaudio.transforms.AmplitudeToDB(stype="power")
+        self._feature_dim = self._infer_feature_dim()
 
     def _pre_emphasise(self, waveform: torch.Tensor) -> torch.Tensor:
         if self.config.pre_emphasis <= 0.0:
@@ -81,13 +109,72 @@ class LogMelExtractor:
         std = waveform.std().clamp_min(eps)
         return waveform / std
 
+    @property
+    def feature_dim(self) -> int:
+        return self._feature_dim
+
+    def _infer_feature_dim(self) -> int:
+        base = self.config.n_mels
+        if self.config.use_deltas:
+            base += self.config.n_mels
+            if self.config.use_delta_delta:
+                base += self.config.n_mels
+        if self.config.use_pitch:
+            base += 2  # pitch and NCCF from Kaldi-style pitch extractor
+        return base
+
+    def _compute_pitch(self, waveform: torch.Tensor) -> torch.Tensor:
+        pitch_feats = torchaudio.functional.compute_kaldi_pitch(
+            waveform.unsqueeze(0),
+            sample_rate=self.config.sample_rate,
+            frame_length=self.config.frame_length_ms,
+            frame_shift=self.config.hop_length_ms,
+            min_f0=self.config.pitch_fmin,
+            max_f0=self.config.pitch_fmax,
+        )
+        # Output shape: (num_frames, 2) -> pitch frequency and NCCF
+        return torch.nan_to_num(pitch_feats.squeeze(0), nan=0.0, posinf=0.0, neginf=0.0)
+
+    def _compute_deltas(self, spec: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        # spec is (time, mel)
+        mel_time = spec.transpose(0, 1).unsqueeze(0)
+        delta_time = torchaudio.functional.compute_deltas(mel_time)
+        delta = delta_time.squeeze(0).transpose(0, 1)
+        delta2 = None
+        if self.config.use_delta_delta:
+            delta2 = torchaudio.functional.compute_deltas(delta_time).squeeze(0).transpose(0, 1)
+        return delta, delta2
+
     def __call__(self, path: Path) -> Tuple[torch.Tensor, int]:
         waveform, sample_rate = self.load_audio(path)
         emphasised = self._pre_emphasise(waveform)
         spec = self._mel_transform(emphasised.unsqueeze(0))
         spec = self._to_db(spec)
         spec = spec.squeeze(0).transpose(0, 1).contiguous()
-        return spec, sample_rate
+
+        features = [spec]
+        if self.config.use_deltas:
+            delta, delta2 = self._compute_deltas(spec)
+            features.append(delta)
+            if self.config.use_delta_delta and delta2 is not None:
+                features.append(delta2)
+        target_len = min(f.size(0) for f in features)
+        features = [f[:target_len] for f in features]
+        if self.config.use_pitch:
+            pitch = self._compute_pitch(emphasised).to(spec.dtype)
+            if pitch.ndim == 1:
+                pitch = pitch.unsqueeze(1)
+            if pitch.size(1) == 1:
+                pitch = torch.cat([pitch, torch.zeros_like(pitch)], dim=1)
+            if pitch.size(0) < target_len:
+                pad = torch.zeros(target_len - pitch.size(0), pitch.size(1), dtype=pitch.dtype)
+                pitch = torch.cat([pitch, pad], dim=0)
+            elif pitch.size(0) > target_len:
+                pitch = pitch[:target_len]
+            features.append(pitch)
+
+        combined = torch.cat(features, dim=1).contiguous()
+        return combined, sample_rate
 
 
 def frame_count(duration: float, config: LogMelConfig) -> int:
@@ -95,3 +182,79 @@ def frame_count(duration: float, config: LogMelConfig) -> int:
 
     hop_length = config.hop_length
     return int(math.floor(duration * config.sample_rate / hop_length)) + 1
+
+
+@dataclass
+class SSLFeatureConfig:
+    """Configuration for self-supervised representation extractors."""
+
+    bundle: str = "WAVLM_BASE_PLUS"
+    layer: int = -1
+    device: str = "cpu"
+
+
+class SSLFeatureExtractor:
+    """Extract contextualised speech representations from SSL models."""
+
+    def __init__(self, config: Optional[SSLFeatureConfig] = None) -> None:
+        self.config = config or SSLFeatureConfig()
+        bundle_key = self.config.bundle.upper()
+        if bundle_key not in _SSL_BUNDLES:
+            available = ", ".join(sorted(_SSL_BUNDLES))
+            raise ValueError(f"Unknown SSL bundle '{self.config.bundle}'. Choose from: {available}")
+        self.bundle = _SSL_BUNDLES[bundle_key]
+        self.sample_rate = int(self.bundle.sample_rate)
+        self.device = torch.device(self.config.device)
+        self.model = self.bundle.get_model().to(self.device)
+        self.model.eval()
+        if hasattr(self.model, "encoder_embed_dim"):
+            self._feature_dim = int(self.model.encoder_embed_dim)
+        elif hasattr(self.model, "proj"):
+            # Fallback for wav2vec-style models
+            self._feature_dim = int(self.model.proj.out_features)
+        else:
+            raise AttributeError("Could not determine feature dimension for SSL model")
+
+    @property
+    def feature_dim(self) -> int:
+        return self._feature_dim
+
+    def load_audio(self, path: Path) -> Tuple[torch.Tensor, int]:
+        waveform, sample_rate = torchaudio.load(str(path))
+        if waveform.size(0) > 1:
+            waveform = waveform.mean(dim=0, keepdim=True)
+        if sample_rate != self.sample_rate:
+            waveform = torchaudio.functional.resample(
+                waveform,
+                orig_freq=sample_rate,
+                new_freq=self.sample_rate,
+            )
+            sample_rate = self.sample_rate
+        return waveform, sample_rate
+
+    def _select_layer(self, all_layers: Tuple[torch.Tensor, ...]) -> torch.Tensor:
+        layer = self.config.layer
+        if layer < 0:
+            layer = len(all_layers) + layer
+        if layer < 0 or layer >= len(all_layers):
+            raise IndexError(
+                f"Requested layer index {self.config.layer} but model returned {len(all_layers)} layers"
+            )
+        return all_layers[layer]
+
+    def __call__(self, path: Path) -> Tuple[torch.Tensor, int]:
+        waveform, sample_rate = self.load_audio(path)
+        waveform = waveform.to(self.device)
+        with torch.inference_mode():
+            outputs = self.model.extract_features(waveform)
+        if isinstance(outputs, tuple):
+            feats = outputs[0]
+        else:
+            feats = outputs
+        if isinstance(feats, torch.Tensor):
+            layer_outputs: Tuple[torch.Tensor, ...] = (feats,)
+        else:
+            layer_outputs = tuple(feats)
+        selected = self._select_layer(layer_outputs)
+        features = selected.squeeze(0).cpu()
+        return features, sample_rate
