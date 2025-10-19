@@ -5,7 +5,7 @@ import json
 import random
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Tuple
 
 import numpy as np
 import torch
@@ -52,37 +52,30 @@ class SpecAugment:
         num_time_masks: int = 2,
         num_freq_masks: int = 2,
         p: float = 0.5,
-        mel_bins: Optional[int] = None,
     ) -> None:
         self.time_mask_param = time_mask_param
         self.freq_mask_param = freq_mask_param
         self.num_time_masks = num_time_masks
         self.num_freq_masks = num_freq_masks
         self.p = p
-        self.mel_bins = mel_bins
 
     def __call__(self, features: torch.Tensor) -> torch.Tensor:
         if torch.rand(1).item() > self.p:
             return features
         augmented = features.clone()
-        num_frames, num_features = augmented.shape
+        num_frames, num_mels = augmented.shape
         for _ in range(self.num_time_masks):
             t = int(torch.randint(low=0, high=self.time_mask_param + 1, size=(1,)).item())
             if t == 0:
                 continue
             t0 = int(torch.randint(low=0, high=max(num_frames - t, 1), size=(1,)).item())
             augmented[t0 : t0 + t, :] = 0.0
-        freq_dim = num_features if self.mel_bins is None else min(self.mel_bins, num_features)
-        if freq_dim <= 0:
-            return augmented
         for _ in range(self.num_freq_masks):
             f = int(torch.randint(low=0, high=self.freq_mask_param + 1, size=(1,)).item())
             if f == 0:
                 continue
-            max_start = max(freq_dim - f, 1)
-            f0 = int(torch.randint(low=0, high=max_start, size=(1,)).item())
-            end = min(f0 + f, freq_dim)
-            augmented[:, f0:end] = 0.0
+            f0 = int(torch.randint(low=0, high=max(num_mels - f, 1), size=(1,)).item())
+            augmented[:, f0 : f0 + f] = 0.0
         return augmented
 
 

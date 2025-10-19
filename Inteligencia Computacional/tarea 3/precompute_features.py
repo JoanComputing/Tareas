@@ -47,19 +47,16 @@ def _process_row(
     output_path = features_root / Path(relative_path).with_suffix(".pt")
     output_path.parent.mkdir(parents=True, exist_ok=True)
     features, _ = _EXTRACTOR(audio_path)
-    features = features.cpu()
-    payload = {"features": features, "num_frames": int(features.shape[0])}
+    payload = {"features": features.cpu(), "num_frames": int(features.shape[0])}
     torch.save(payload, output_path)
     if use_for_stats:
-        sum_vec = features.sum(dim=0).double().numpy()
-        sumsq_vec = features.pow(2).sum(dim=0).double().numpy()
+        sum_vec = features.sum(dim=0).cpu().numpy()
+        sumsq_vec = (features.pow(2).sum(dim=0)).cpu().numpy()
         count = int(features.shape[0])
         return sum_vec, sumsq_vec, count
-    return (
-        np.zeros(_EXTRACTOR.feature_dim, dtype=np.float64),
-        np.zeros(_EXTRACTOR.feature_dim, dtype=np.float64),
-        0,
-    )
+    return np.zeros(_EXTRACTOR.config.n_mels, dtype=np.float64), np.zeros(
+        _EXTRACTOR.config.n_mels, dtype=np.float64
+    ), 0
 
 
 def parse_args() -> argparse.Namespace:
@@ -78,12 +75,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n-fft", type=int, default=1024)
     parser.add_argument("--hop-length", type=int, default=256)
     parser.add_argument("--pre-emphasis", type=float, default=0.97)
-    parser.add_argument("--no-deltas", dest="use_deltas", action="store_false")
-    parser.add_argument("--no-delta-delta", dest="use_delta_delta", action="store_false")
-    parser.add_argument("--no-pitch", dest="use_pitch", action="store_false")
-    parser.add_argument("--pitch-fmin", type=float, default=60.0)
-    parser.add_argument("--pitch-fmax", type=float, default=500.0)
-    parser.set_defaults(use_deltas=True, use_delta_delta=True, use_pitch=True)
     return parser.parse_args()
 
 
@@ -100,15 +91,7 @@ def main() -> None:
         n_fft=args.n_fft,
         hop_length=args.hop_length,
         pre_emphasis=args.pre_emphasis,
-        use_deltas=args.use_deltas,
-        use_delta_delta=args.use_delta_delta,
-        use_pitch=args.use_pitch,
-        pitch_fmin=args.pitch_fmin,
-        pitch_fmax=args.pitch_fmax,
     )
-
-    prototype = LogMelExtractor(config)
-    feature_dim = prototype.feature_dim
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -117,8 +100,8 @@ def main() -> None:
         for row in df.itertuples()
     ]
 
-    total_sum = np.zeros(feature_dim, dtype=np.float64)
-    total_sumsq = np.zeros(feature_dim, dtype=np.float64)
+    total_sum = np.zeros(config.n_mels, dtype=np.float64)
+    total_sumsq = np.zeros(config.n_mels, dtype=np.float64)
     total_frames = 0
 
     with mp.get_context("spawn").Pool(
@@ -161,16 +144,9 @@ def main() -> None:
             "n_fft": config.n_fft,
             "hop_length": config.hop_length,
             "pre_emphasis": config.pre_emphasis,
-            "use_deltas": config.use_deltas,
-            "use_delta_delta": config.use_delta_delta,
-            "use_pitch": config.use_pitch,
-            "pitch_fmin": config.pitch_fmin,
-            "pitch_fmax": config.pitch_fmax,
         },
         "num_rows": len(df),
         "train_frames": int(total_frames),
-        "feature_dim": feature_dim,
-        "mel_bins": config.n_mels,
     }
     save_json(metadata, args.output_dir / "metadata.json")
     print("Feature extraction complete. Normalisation statistics saved.")

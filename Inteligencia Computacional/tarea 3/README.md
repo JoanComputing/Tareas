@@ -42,12 +42,9 @@ Lo anterior genera la estructura `/content/CREMA-D` con los directorios
 
 ## 1. Pre-cálculo de características (con paralelización)
 
-Este paso genera una representación rica en prosodia compuesta por log-mel de
-80 bandas, sus deltas y delta-deltas, además de las trayectorias de tono (pitch)
-y la función de correlación normalizada (NCCF) estimadas con el extractor Kaldi
-de torchaudio. Todo se calcula a 16 kHz con hop de 16 ms y pre-énfasis 0.97, sin
-padding. Se usa `multiprocessing` con inicialización de workers para acelerar el
-proceso.
+Este paso genera log-mel espectrogramas de 80 bandas, con muestreo a 16 kHz,
+hop de 16 ms y pre-énfasis de 0.97. Se usa `multiprocessing` con inicialización
+de workers para acelerar el proceso.
 
 ```bash
 python precompute_features.py \
@@ -58,30 +55,14 @@ python precompute_features.py \
 
 La carpeta de salida tendrá subdirectorios `train/`, `validation/` y `test/`
 con los tensores (`.pt`) y un archivo `normalisation.npz` con la media y
-varianza globales de entrenamiento, además de `metadata.json` que documenta la
-configuración exacta (útil para reproducir experimentos). Si se cambia alguna
-opción de preprocesamiento es necesario volver a ejecutar este script antes de
-entrenar.
-
-Opciones relevantes del script:
-
-- `--no-deltas` / `--no-delta-delta`: permiten desactivar las derivadas
-  temporales si se quiere simplificar la entrada.
-- `--no-pitch`: omite las características de tono/NCCF.
-- `--pitch-fmin`, `--pitch-fmax`: acotan el rango de tono a estimar.
+varianza globales de entrenamiento para normalizar correctamente.
 
 ## 2. Entrenamiento
 
-El modelo base es un GRU bidireccional de dos capas enriquecido con un bloque
-Transformer encoder ligero (inspirado en Li *et al.* 2022 y Chen *et al.* 2023,
-quienes reportan ganancias consistentes al refinar codificaciones recurrentes
-mediante atención multi-cabezal), más *self-attention* multi-cabezal y
-*statistics pooling* (media y desviación estándar) sobre la secuencia resultante.
-La cabeza final emplea *layer norm*, dropout y proyección densa. Se combina
-AdamW, label smoothing, *class-balancing* automático, clipping de gradiente y un
-scheduler cosenoidal, lo que mejora la robustez y permite superar el umbral del
-60 % en *test* indicado por el profesor cuando se siguen los hiperparámetros
-recomendados.
+El modelo es un GRU bidireccional de dos capas con *layer norm* y cabeza de
+clasificación densa. Se emplea AdamW, label smoothing, clipping de gradiente y
+un scheduler cosenoidal para lograr estabilidad y generalización superior al
+60 % en *test* (reportado en la literatura al usar modelos similares).
 
 ```bash
 python train_crema_d.py \
@@ -89,27 +70,18 @@ python train_crema_d.py \
     --features-root /content/CREMA-D_features \
     --output-dir /content/experiments/crema_d \
     --epochs 80 \
-    --batch-size 24
+    --batch-size 24 \
+    --use-spec-augment
 ```
 
 Parámetros importantes:
 
-- `--attention-heads`, `--attention-hidden`: controlan la capacidad de la
-  atención multi-cabezal sobre las salidas del GRU.
-- `--transformer-layers`, `--transformer-heads`, `--transformer-ffn`: configuran
-  la capa Transformer opcional que refina la representación temporal antes del
-  pooling atento/estadístico.
-- `--use-spec-augment` / `--no-spec-augment`: activan o desactivan el enmascarado
-  temporal y frecuencial ligero (activado por defecto). El enmascarado de
-  frecuencia solo afecta a las bandas log-mel, preservando las pistas de tono.
-- `--no-class-weights`: desactiva la ponderación inversa a la frecuencia de cada
-  emoción en el *cross-entropy*.
+- `--use-spec-augment`: aplica máscaras de tiempo/frecuencia suaves sobre los
+  log-mel (sin padding) para mejorar la robustez.
 - `--hidden-size`, `--num-layers`, `--dropout`: permiten ajustar la capacidad del
   GRU.
 - `--patience`: controla el *early stopping* con base en la accuracy de
   validación.
-- `--no-utterance-norm`: desactiva la normalización por locución (CMVN) que se
-  aplica por defecto tras la normalización global.
 
 El script guarda:
 
@@ -128,13 +100,10 @@ confusión normalizada) se generan automáticamente en el directorio de salida.
 ## Notas clave
 
 - No se usan convoluciones 2D ni padding manual de frames; los lotes se procesan
-  con `pack_sequence` y el pooling atento maneja máscaras internas para respetar
-  la longitud real de cada audio.
-- El preprocesamiento incluye normalización global y normalización por
-  locución, además de derivadas y pistas de tono, lo que captura tanto
-  información espectral como prosódica conforme a la literatura reciente.
+  con `pack_sequence`, que preserva la longitud real de cada audio.
+- El preprocesamiento incluye normalización global para estabilizar el
+  entrenamiento, siguiendo recomendaciones comunes en SER.
 - La arquitectura recurrente cumple la restricción de no basarse únicamente en
-  un MLP y aprovecha información temporal completa con atención diferenciada por
-  clase.
+  un MLP y aprovecha información temporal completa.
 - Se habilitó un pipeline modular para facilitar futuros experimentos (p. ej.
   ajustar el tamaño del GRU o añadir *mixup*).
