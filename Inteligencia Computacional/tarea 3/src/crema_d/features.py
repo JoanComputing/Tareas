@@ -9,6 +9,7 @@ or fixed-length padding.
 from __future__ import annotations
 
 import math
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Tuple
@@ -124,16 +125,40 @@ class LogMelExtractor:
         return base
 
     def _compute_pitch(self, waveform: torch.Tensor) -> torch.Tensor:
-        pitch_feats = torchaudio.functional.compute_kaldi_pitch(
+        if hasattr(torchaudio.functional, "compute_kaldi_pitch"):
+            pitch_feats = torchaudio.functional.compute_kaldi_pitch(
+                waveform.unsqueeze(0),
+                sample_rate=self.config.sample_rate,
+                frame_length=self.config.frame_length_ms,
+                frame_shift=self.config.hop_length_ms,
+                min_f0=self.config.pitch_fmin,
+                max_f0=self.config.pitch_fmax,
+            )
+            # Output shape: (num_frames, 2) -> pitch frequency and NCCF
+            return torch.nan_to_num(
+                pitch_feats.squeeze(0), nan=0.0, posinf=0.0, neginf=0.0
+            )
+
+        # Fallback to detect_pitch_frequency when Kaldi pitch extraction is unavailable
+        warnings.warn(
+            "torchaudio.functional.compute_kaldi_pitch is unavailable; "
+            "falling back to detect_pitch_frequency without NCCF.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        frame_time = self.config.hop_length_ms / 1000.0
+        win_length = max(int(round(self.config.frame_length_ms)), 1)
+        pitch = torchaudio.functional.detect_pitch_frequency(
             waveform.unsqueeze(0),
             sample_rate=self.config.sample_rate,
-            frame_length=self.config.frame_length_ms,
-            frame_shift=self.config.hop_length_ms,
-            min_f0=self.config.pitch_fmin,
-            max_f0=self.config.pitch_fmax,
-        )
-        # Output shape: (num_frames, 2) -> pitch frequency and NCCF
-        return torch.nan_to_num(pitch_feats.squeeze(0), nan=0.0, posinf=0.0, neginf=0.0)
+            frame_time=frame_time,
+            win_length=win_length,
+            freq_low=int(round(self.config.pitch_fmin)),
+            freq_high=int(round(self.config.pitch_fmax)),
+        ).squeeze(0)
+        pitch = torch.nan_to_num(pitch, nan=0.0, posinf=0.0, neginf=0.0)
+        nccf = torch.zeros_like(pitch)
+        return torch.stack([pitch, nccf], dim=-1)
 
     def _compute_deltas(self, spec: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         # spec is (time, mel)
