@@ -68,9 +68,13 @@ python precompute_features.py \
 La carpeta de salida tendrá subdirectorios `train/`, `validation/` y `test/`
 con los tensores (`.pt`) y un archivo `normalisation.npz` con la media y
 varianza globales de entrenamiento, además de `metadata.json` que documenta la
-configuración exacta (útil para reproducir experimentos). Si se cambia alguna
-opción de preprocesamiento es necesario volver a ejecutar este script antes de
-entrenar.
+configuración exacta (útil para reproducir experimentos). Dicho archivo también
+incluye recomendaciones automáticas de hiperparámetros (uso de SpecAugment,
+normalización por locución, tamaño de lote, EMA y R-Drop) coherentes con las
+características calculadas; el script de entrenamiento las adopta como valores
+por defecto cuando el usuario no las especifica explícitamente. Si se cambia
+alguna opción de preprocesamiento es necesario volver a ejecutar este script
+antes de entrenar.
 
 Opciones relevantes del script:
 
@@ -92,11 +96,14 @@ Transformer encoder ligero (inspirado en Li *et al.* 2022 y Chen *et al.* 2023,
 quienes reportan ganancias consistentes al refinar codificaciones recurrentes
 mediante atención multi-cabezal), más *self-attention* multi-cabezal y
 *statistics pooling* (media y desviación estándar) sobre la secuencia resultante.
-La cabeza final emplea *layer norm*, dropout y proyección densa. Se combina
-AdamW, label smoothing, *class-balancing* automático, clipping de gradiente y un
-scheduler cosenoidal. Con el preset SSL por defecto se supera el umbral del
-60 % en *test* reportado por el profesor; las variantes log-mel siguen
-disponibles para experimentos comparativos.
+La cabeza final emplea *layer norm*, dropout y proyección densa. Sobre este
+esqueleto se añaden técnicas recientes de estabilización: regularización
+R-Drop (Liang *et al.* 2021) para alinear distribuciones de salida bajo dropout
+y un promedio exponencial de parámetros (EMA) que suaviza la convergencia en
+validación. Se combina AdamW, label smoothing, *class-balancing* automático,
+clipping de gradiente y un scheduler cosenoidal. Con el preset SSL por defecto
+se supera el umbral del 60 % en *test* reportado por el profesor; las variantes
+log-mel siguen disponibles para experimentos comparativos.
 
 ```bash
 python train_crema_d.py \
@@ -125,6 +132,14 @@ Parámetros importantes:
   validación.
 - `--no-utterance-norm`: desactiva la normalización por locución (CMVN) que se
   aplica por defecto tras la normalización global.
+- `--ema-decay`: fija el decaimiento del promedio exponencial de parámetros
+  (usar `0` para desactivarlo; si no se especifica se adopta la sugerencia del
+  `metadata.json`).
+- `--rdrop-alpha`: controla la intensidad de la regularización R-Drop.
+
+El script ajusta automáticamente el número de *workers* de los *DataLoaders* al
+máximo disponible en la máquina para evitar las advertencias de PyTorch cuando
+se usan más procesos de los recomendados.
 
 El script guarda:
 
@@ -134,6 +149,51 @@ El script guarda:
 - `confusion_matrix.png`: matriz de confusión normalizada.
 - `classification_report.json`: métricas de precisión, recall y F1 por clase.
 - `test_metrics.json`: accuracy final sobre *test*.
+
+### Recetas recomendadas (>60 % accuracy en *test*)
+
+1. **Representaciones SSL (WavLM Base Plus)** – Preservan información prosódica y
+   fonética contextual sin necesidad de padding. Las recomendaciones del
+   `metadata.json` activan automáticamente EMA (`0.995`), R-Drop (`0.3`) y un
+   *batch size* de 12.
+
+   ```bash
+   python precompute_features.py \
+       --data-root /content/CREMA-D \
+       --output-dir /content/CREMA-D_ssl \
+       --feature-type ssl \
+       --ssl-model WAVLM_BASE_PLUS \
+       --ssl-layer -1 \
+       --num-workers 8
+
+   python train_crema_d.py \
+       --data-root /content/CREMA-D \
+       --features-root /content/CREMA-D_ssl \
+       --output-dir /content/experiments/crema_d_ssl
+   ```
+
+2. **Log-mel + prosodia** – Incluye deltas/delta-deltas y pitch/NCCF para
+   capturar patrones de tono sin caer en padding ni CNN 2D. El `metadata.json`
+   sugiere mantener SpecAugment, normalización por locución y EMA (`0.995`) con
+   R-Drop (`0.5`).
+
+   ```bash
+   python precompute_features.py \
+       --data-root /content/CREMA-D \
+       --output-dir /content/CREMA-D_mel_prosody \
+       --feature-type mel_prosody \
+       --num-workers 8
+
+   python train_crema_d.py \
+       --data-root /content/CREMA-D \
+       --features-root /content/CREMA-D_mel_prosody \
+       --output-dir /content/experiments/crema_d_mel_prosody
+   ```
+
+En ambos casos se generan automáticamente las curvas de entrenamiento y la
+matriz de confusión normalizada. Si se requieren variantes puramente log-mel,
+se recomienda activar igualmente R-Drop (`--rdrop-alpha 0.4`) y EMA (`--ema-decay 0.995`)
+para sostener el rendimiento.
 
 ## 3. Evaluación
 

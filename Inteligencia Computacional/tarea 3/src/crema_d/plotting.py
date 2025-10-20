@@ -17,6 +17,8 @@ def plot_history(
 
     axes[0].plot(epochs, history["train_loss"], label="Train")
     axes[0].plot(epochs, history["val_loss"], label="Val")
+    if "val_loss_ema" in history:
+        axes[0].plot(epochs, history["val_loss_ema"], label="Val (EMA)", linestyle="--")
     axes[0].set_title("Loss")
     axes[0].set_xlabel("Epoch")
     axes[0].set_ylabel("Cross-entropy")
@@ -25,6 +27,8 @@ def plot_history(
 
     axes[1].plot(epochs, history["train_accuracy"], label="Train")
     axes[1].plot(epochs, history["val_accuracy"], label="Val")
+    if "val_accuracy_ema" in history:
+        axes[1].plot(epochs, history["val_accuracy_ema"], label="Val (EMA)", linestyle="--")
     axes[1].set_title("Accuracy")
     axes[1].set_xlabel("Epoch")
     axes[1].set_ylabel("Accuracy")

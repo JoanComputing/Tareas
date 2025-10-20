@@ -42,6 +42,61 @@ def sklearn_classification_summary(
     return {"confusion_matrix": conf.tolist(), "classification_report": report}
 
 
+class ModelEMA:
+    """Maintain an exponential moving average of model parameters."""
+
+    def __init__(self, model: torch.nn.Module, decay: float = 0.995) -> None:
+        if not 0.0 <= decay <= 1.0:
+            raise ValueError("EMA decay must lie in [0, 1]")
+        self.decay = decay
+        self.shadow: Dict[str, torch.Tensor] = {}
+        self.backup: Dict[str, torch.Tensor] = {}
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                self.shadow[name] = param.detach().clone()
+
+    def update(self, model: torch.nn.Module) -> None:
+        if self.decay <= 0.0:
+            for name, param in model.named_parameters():
+                if param.requires_grad:
+                    self.shadow[name] = param.detach().clone()
+            return
+        with torch.no_grad():
+            for name, param in model.named_parameters():
+                if not param.requires_grad:
+                    continue
+                data = param.detach()
+                shadow = self.shadow[name]
+                shadow.mul_(self.decay).add_(data, alpha=1.0 - self.decay)
+
+    def store(self, model: torch.nn.Module) -> None:
+        self.backup = {}
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                self.backup[name] = param.detach().clone()
+
+    def restore(self, model: torch.nn.Module) -> None:
+        if not self.backup:
+            return
+        with torch.no_grad():
+            for name, param in model.named_parameters():
+                if param.requires_grad:
+                    param.copy_(self.backup[name])
+        self.backup = {}
+
+    def copy_to(self, model: torch.nn.Module) -> None:
+        with torch.no_grad():
+            for name, param in model.named_parameters():
+                if param.requires_grad:
+                    param.copy_(self.shadow[name].to(param.device))
+
+    def state_dict(self) -> Dict[str, torch.Tensor]:
+        return {name: tensor.clone() for name, tensor in self.shadow.items()}
+
+    def load_state_dict(self, state_dict: Dict[str, torch.Tensor]) -> None:
+        self.shadow = {name: tensor.clone() for name, tensor in state_dict.items()}
+
+
 class SpecAugment:
     """Lightweight SpecAugment implementation operating on mel features."""
 

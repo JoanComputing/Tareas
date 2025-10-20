@@ -24,12 +24,14 @@ import argparse
 import json
 import sys
 from pathlib import Path
+import multiprocessing as mp
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 import torch
 from torch import nn
+import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
@@ -44,11 +46,15 @@ from crema_d.models import EmotionGRU
 from crema_d.plotting import plot_confusion_matrix, plot_history
 from crema_d.utils import (
     Metrics,
+    ModelEMA,
     SpecAugment,
     load_json,
     set_seed,
     sklearn_classification_summary,
 )
+
+
+DEFAULT_BATCH_SIZE = 24
 
 
 def parse_args() -> argparse.Namespace:
@@ -58,7 +64,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, required=True, help="Where to store models and plots")
     parser.add_argument("--csv", type=str, default="labels.csv", help="Relative path to labels CSV")
     parser.add_argument("--epochs", type=int, default=80)
-    parser.add_argument("--batch-size", type=int, default=24)
+    parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--seed", type=int, default=42)
@@ -74,11 +80,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--transformer-layers", type=int, default=2)
     parser.add_argument("--transformer-heads", type=int, default=4)
     parser.add_argument("--transformer-ffn", type=int, default=1024)
-    parser.add_argument("--use-spec-augment", action="store_true")
+    parser.add_argument("--ema-decay", type=float, default=0.0, help="EMA decay (0 disables EMA)")
+    parser.add_argument("--rdrop-alpha", type=float, default=0.0, help="R-Drop coefficient")
+    parser.add_argument("--use-spec-augment", dest="use_spec_augment", action="store_true")
     parser.add_argument("--no-spec-augment", dest="use_spec_augment", action="store_false")
     parser.add_argument("--no-class-weights", dest="use_class_weights", action="store_false")
+    parser.add_argument("--use-utterance-norm", dest="per_utterance_norm", action="store_true")
     parser.add_argument("--no-utterance-norm", dest="per_utterance_norm", action="store_false")
-    parser.set_defaults(use_spec_augment=True, use_class_weights=True, per_utterance_norm=True)
+    parser.set_defaults(
+        use_spec_augment=None,
+        use_class_weights=True,
+        per_utterance_norm=None,
+    )
     return parser.parse_args()
 
 
@@ -144,11 +157,18 @@ def make_dataloaders(
         per_utterance_norm=per_utterance_norm,
     )
 
+    available_cpus = mp.cpu_count() or 1
+    effective_workers = max(0, min(num_workers, available_cpus))
+    if effective_workers != num_workers:
+        print(
+            f"Adjusting DataLoader workers from {num_workers} to {effective_workers} based on system capacity."
+        )
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=num_workers,
+        num_workers=effective_workers,
         collate_fn=emotion_collate,
         pin_memory=True,
     )
@@ -156,7 +176,7 @@ def make_dataloaders(
         val_dataset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=num_workers,
+        num_workers=effective_workers,
         collate_fn=emotion_collate,
         pin_memory=True,
     )
@@ -164,7 +184,7 @@ def make_dataloaders(
         test_dataset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=num_workers,
+        num_workers=effective_workers,
         collate_fn=emotion_collate,
         pin_memory=True,
     )
@@ -189,6 +209,8 @@ def run_epoch(
     optimizer: Optional[torch.optim.Optimizer],
     device: torch.device,
     grad_clip: float = 0.0,
+    ema: Optional[ModelEMA] = None,
+    rdrop_alpha: float = 0.0,
 ) -> Metrics:
     is_train = optimizer is not None
     model.train(is_train)
@@ -201,7 +223,20 @@ def run_epoch(
         targets = targets.to(device)
         lengths = lengths.to(device)
         logits = model(features, lengths)
-        loss = criterion(logits, targets)
+        if is_train and rdrop_alpha > 0.0:
+            logits_second = model(features, lengths)
+            ce_loss = 0.5 * (criterion(logits, targets) + criterion(logits_second, targets))
+            log_probs_first = F.log_softmax(logits, dim=-1)
+            log_probs_second = F.log_softmax(logits_second, dim=-1)
+            probs_first = log_probs_first.exp()
+            probs_second = log_probs_second.exp()
+            kl_first = F.kl_div(log_probs_first, probs_second, reduction="batchmean")
+            kl_second = F.kl_div(log_probs_second, probs_first, reduction="batchmean")
+            kl_loss = 0.5 * (kl_first + kl_second)
+            loss = ce_loss + rdrop_alpha * kl_loss
+            logits = 0.5 * (logits + logits_second)
+        else:
+            loss = criterion(logits, targets)
 
         if is_train:
             optimizer.zero_grad()
@@ -209,6 +244,8 @@ def run_epoch(
             if grad_clip > 0:
                 nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             optimizer.step()
+            if ema is not None:
+                ema.update(model)
 
         batch_size = targets.size(0)
         total_loss += loss.item() * batch_size
@@ -239,6 +276,22 @@ def evaluate_predictions(
     return np.array(predictions), np.array(targets)
 
 
+def evaluate_with_ema(
+    model: nn.Module,
+    data_loader: DataLoader,
+    criterion: nn.Module,
+    device: torch.device,
+    ema: ModelEMA,
+) -> Metrics:
+    ema.store(model)
+    ema.copy_to(model)
+    try:
+        metrics = run_epoch(model, data_loader, criterion, None, device)
+    finally:
+        ema.restore(model)
+    return metrics
+
+
 def main() -> None:
     args = parse_args()
     set_seed(args.seed)
@@ -266,6 +319,29 @@ def main() -> None:
             "Regenerate features to ensure consistency."
         )
 
+    recommendations = metadata.get("recommendations", {})
+    if args.use_spec_augment is None:
+        args.use_spec_augment = bool(recommendations.get("spec_augment", True))
+        print(
+            f"SpecAugment not specified, following metadata recommendation: {args.use_spec_augment}."
+        )
+    if args.per_utterance_norm is None:
+        args.per_utterance_norm = bool(recommendations.get("per_utterance_norm", True))
+        print(
+            "Per-utterance normalisation not specified, "
+            f"following metadata recommendation: {args.per_utterance_norm}."
+        )
+    recommended_batch = recommendations.get("batch_size")
+    if recommended_batch is not None and args.batch_size == DEFAULT_BATCH_SIZE:
+        args.batch_size = int(recommended_batch)
+        print(f"Batch size adjusted to recommended value {args.batch_size} for these features.")
+    if args.ema_decay <= 0.0 and recommendations.get("ema_decay"):
+        args.ema_decay = float(recommendations["ema_decay"])
+        print(f"EMA decay set from metadata recommendation: {args.ema_decay}")
+    if args.rdrop_alpha <= 0.0 and recommendations.get("rdrop_alpha"):
+        args.rdrop_alpha = float(recommendations["rdrop_alpha"])
+        print(f"R-Drop alpha set from metadata recommendation: {args.rdrop_alpha}")
+
     train_loader, val_loader, test_loader, class_counts = make_dataloaders(
         df,
         args.features_root,
@@ -291,6 +367,10 @@ def main() -> None:
         transformer_ffn=args.transformer_ffn,
     ).to(device)
 
+    ema: Optional[ModelEMA] = None
+    if args.ema_decay > 0.0:
+        ema = ModelEMA(model, decay=args.ema_decay)
+
     if args.use_class_weights:
         class_weights = compute_class_weights(class_counts).to(device)
     else:
@@ -308,14 +388,47 @@ def main() -> None:
         "val_loss": [],
         "val_accuracy": [],
     }
+    if ema is not None:
+        history["val_loss_ema"] = []
+        history["val_accuracy_ema"] = []
 
     best_val_acc = 0.0
     best_state = None
     epochs_without_improvement = 0
 
     for epoch in range(1, args.epochs + 1):
-        train_metrics = run_epoch(model, train_loader, criterion, optimizer, device, args.grad_clip)
+        train_metrics = run_epoch(
+            model,
+            train_loader,
+            criterion,
+            optimizer,
+            device,
+            args.grad_clip,
+            ema=ema,
+            rdrop_alpha=args.rdrop_alpha,
+        )
         val_metrics = run_epoch(model, val_loader, criterion, None, device)
+        val_score = val_metrics.accuracy
+        candidate_state = {
+            "model": model.state_dict(),
+            "ema": False,
+            "epoch": epoch,
+        }
+        if ema is not None:
+            ema_val_metrics = evaluate_with_ema(model, val_loader, criterion, device, ema)
+            history["val_loss_ema"].append(ema_val_metrics.loss)
+            history["val_accuracy_ema"].append(ema_val_metrics.accuracy)
+            if ema_val_metrics.accuracy > val_score:
+                val_score = ema_val_metrics.accuracy
+                candidate_state = {
+                    "model": ema.state_dict(),
+                    "ema": True,
+                    "epoch": epoch,
+                }
+        elif "val_loss_ema" in history:
+            history["val_loss_ema"].append(val_metrics.loss)
+            history["val_accuracy_ema"].append(val_metrics.accuracy)
+
         scheduler.step()
 
         history["train_loss"].append(train_metrics.loss)
@@ -328,13 +441,15 @@ def main() -> None:
             f"Val loss {val_metrics.loss:.4f} acc {val_metrics.accuracy:.3f}"
         )
 
-        if val_metrics.accuracy > best_val_acc:
-            best_val_acc = val_metrics.accuracy
+        if val_score > best_val_acc:
+            best_val_acc = val_score
             best_state = {
-                "model": model.state_dict(),
+                "model": candidate_state["model"],
                 "optimizer": optimizer.state_dict(),
-                "epoch": epoch,
+                "epoch": candidate_state["epoch"],
                 "val_accuracy": best_val_acc,
+                "ema": candidate_state["ema"],
+                "ema_decay": args.ema_decay,
             }
             torch.save(best_state, args.output_dir / "best_model.pt")
             epochs_without_improvement = 0
@@ -347,7 +462,14 @@ def main() -> None:
     if best_state is None:
         raise RuntimeError("Training did not produce any model checkpoint")
 
-    model.load_state_dict(best_state["model"])
+    if best_state.get("ema", False):
+        if args.ema_decay <= 0.0:
+            args.ema_decay = best_state.get("ema_decay", 0.0)
+        ema_for_eval = ModelEMA(model, decay=args.ema_decay if args.ema_decay > 0 else 0.0)
+        ema_for_eval.load_state_dict(best_state["model"])
+        ema_for_eval.copy_to(model)
+    else:
+        model.load_state_dict(best_state["model"])
     predictions, targets = evaluate_predictions(model, test_loader, device)
     summary = sklearn_classification_summary(predictions, targets, list(range(encoder.num_classes)))
     test_accuracy = (predictions == targets).mean()

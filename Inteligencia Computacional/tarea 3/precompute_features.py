@@ -209,6 +209,31 @@ def main() -> None:
         "feature_dim": feature_dim,
     }
     if feature_type == "ssl":
+        recommendations = {
+            "spec_augment": False,
+            "per_utterance_norm": False,
+            "batch_size": 12,
+            "ema_decay": 0.995,
+            "rdrop_alpha": 0.3,
+        }
+    elif feature_type == "mel_prosody":
+        recommendations = {
+            "spec_augment": True,
+            "per_utterance_norm": True,
+            "batch_size": 24,
+            "ema_decay": 0.995,
+            "rdrop_alpha": 0.5,
+        }
+    else:
+        recommendations = {
+            "spec_augment": True,
+            "per_utterance_norm": False,
+            "batch_size": 24,
+            "ema_decay": 0.995,
+            "rdrop_alpha": 0.4,
+        }
+    metadata["recommendations"] = recommendations
+    if feature_type == "ssl":
         metadata.update(
             {
                 "config": {
